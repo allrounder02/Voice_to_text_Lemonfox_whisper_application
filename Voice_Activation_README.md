@@ -107,6 +107,7 @@ VAD_SILENCE_DURATION=1.5
 VAD_SAMPLE_RATE=16000
 ```
 
+
 ## Integration
 
 This module integrates with the main LemonFox transcriber and uses the same configuration system, ensuring consistency and security of your API keys.
