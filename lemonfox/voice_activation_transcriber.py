@@ -7,6 +7,10 @@ while integrating with the new voice module
 
 import logging
 import os
+import threading
+import queue
+import time
+import signal
 from typing import Optional
 
 # Try importing each component separately to identify which one fails
@@ -14,25 +18,25 @@ VOICE_MODULE_AVAILABLE = True
 failed_imports = []
 
 try:
-    from voice.voice_app import VoiceToTextApp
+    from lemonfox.voice.voice_app import VoiceToTextApp
 except ImportError as e:
     failed_imports.append(f"VoiceToTextApp: {e}")
     VoiceToTextApp = None
 
 try:
-    from voice.voice_recorder import VoiceRecorder
+    from lemonfox.voice.voice_recorder import VoiceRecorder
 except ImportError as e:
     failed_imports.append(f"VoiceRecorder: {e}")
     VoiceRecorder = None
 
 try:
-    from voice.vad_processor import VADProcessor
+    from lemonfox.voice.vad_processor import VADProcessor
 except ImportError as e:
     failed_imports.append(f"VADProcessor: {e}")
     VADProcessor = None
 
 try:
-    from voice.text_injector import TextInjector
+    from lemonfox.voice.text_injector import TextInjector
 except ImportError as e:
     failed_imports.append(f"TextInjector: {e}")
     TextInjector = None
@@ -62,6 +66,9 @@ class VoiceActivationTranscriber:
 
         self.logger = logging.getLogger(__name__)
         self.config = load_config()
+        self.running = False
+        self.voice_app = None
+        self._original_sigint_handler = None
 
         if VOICE_MODULE_AVAILABLE:
             # Check each module again to see which ones are available
@@ -103,6 +110,9 @@ class VoiceActivationTranscriber:
             return
 
         try:
+            self.running = True
+            # Start voice app without blocking
+            # Don't install signal handlers in the voice app
             self.voice_app.start()
             self.logger.info("Voice activation started")
         except Exception as e:
@@ -110,8 +120,9 @@ class VoiceActivationTranscriber:
 
     def stop_voice_activation(self) -> None:
         """Stop voice activation"""
-        if self.voice_app:
+        if self.voice_app and self.running:
             try:
+                self.running = False
                 self.voice_app.quit()
                 self.logger.info("Voice activation stopped")
             except Exception as e:
@@ -136,7 +147,6 @@ class VoiceActivationTranscriber:
             self.recorder.start_recording()
 
             if duration_seconds:
-                import time
                 time.sleep(duration_seconds)
             else:
                 input("Press Enter to stop recording...")
@@ -200,55 +210,3 @@ class VoiceActivationTranscriber:
                 self.logger.info("Continuous listening stopped")
             except Exception as e:
                 self.logger.error(f"Failed to stop continuous listening: {e}")
-
-def main():
-    """Standalone entry point for voice activation transcriber"""
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Voice Activation Transcriber")
-    parser.add_argument('--verbose', action='store_true', help="Enable verbose logging")
-    parser.add_argument('--mode', choices=['record', 'listen'], default='record',
-                        help="Mode: 'record' for single recording, 'listen' for continuous")
-    parser.add_argument('--duration', type=int, help="Recording duration in seconds")
-
-    args = parser.parse_args()
-
-    # Setup basic logging since we don't have setup_logging function
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-
-    transcriber = VoiceActivationTranscriber(verbose=args.verbose)
-
-    try:
-        if args.mode == 'record':
-            result = transcriber.record_and_transcribe(args.duration)
-            if result:
-                print(f"\nTranscription: {result}")
-        else:
-            print("Starting continuous listening mode. Press Ctrl+C to stop.")
-            transcriber.start_voice_activation()
-            transcriber.start_continuous_listening()
-
-            try:
-                while True:
-                    import time
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                print("\nStopping...")
-            finally:
-                transcriber.stop_continuous_listening()
-                transcriber.stop_voice_activation()
-
-    except Exception as e:
-        logging.error(f"Error: {e}")
-        return 1
-
-    return 0
-
-
-if __name__ == "__main__":
-    import sys
-
-    sys.exit(main())

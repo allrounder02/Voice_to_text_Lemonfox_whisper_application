@@ -4,6 +4,7 @@ import logging
 import threading
 import queue
 import time
+import signal
 
 from .voice_recorder import VoiceRecorder
 from .vad_processor import VADProcessor
@@ -39,10 +40,14 @@ class VoiceToTextApp:
         self.is_listening = False
         self.active_window = None
         self.running = True
+        self.should_quit = False
 
         # Queues for processing
         self.audio_queue = queue.Queue()
         self.transcription_queue = queue.Queue()
+
+        # Store original signal handler
+        self.original_sigint_handler = signal.getsignal(signal.SIGINT)
 
     def _setup_logging(self):
         """Setup logging configuration"""
@@ -69,13 +74,6 @@ class VoiceToTextApp:
         threading.Thread(target=self.transcription_worker, daemon=True).start()
 
         self.logger.info("Application started successfully")
-
-        # Keep main thread alive
-        try:
-            while self.running:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            self.quit()
 
     def toggle_recording(self):
         """Toggle recording state"""
@@ -128,18 +126,30 @@ class VoiceToTextApp:
 
     def listening_loop(self):
         """Main loop for listening mode with VAD"""
-        while self.is_listening:
-            # Start recording
-            self.recorder.start_recording()
+        # Start recording immediately
+        self.recorder.start_recording()
 
-            # Process with VAD
-            self.vad_processor.process_stream(
-                self.recorder.audio_queue,
-                callback=self.handle_speech_detected
+        try:
+            # Create a separate thread for VAD processing
+            vad_thread = threading.Thread(
+                target=self.vad_processor.process_stream,
+                args=(self.recorder.audio_queue, self.handle_speech_detected),
+                daemon=True
             )
+            vad_thread.start()
 
-            # Small pause between checks
-            time.sleep(0.1)
+            # Monitor listening state
+            while self.is_listening and self.running:
+                time.sleep(0.5)
+
+        except Exception as e:
+            self.logger.error(f"Error in listening loop: {e}")
+        finally:
+            # Stop recording when exiting
+            if self.recorder.is_recording:
+                self.recorder.stop_recording()
+            # Signal VAD to stop processing
+            self.recorder.audio_queue.put(None)
 
     def handle_speech_detected(self, audio_file):
         """Handle detected speech in listening mode"""
@@ -148,7 +158,7 @@ class VoiceToTextApp:
 
     def audio_processor_worker(self):
         """Worker thread for processing audio files"""
-        while self.running:
+        while self.running and not self.should_quit:
             try:
                 audio_file = self.audio_queue.get(timeout=2)
                 if audio_file:
@@ -161,14 +171,19 @@ class VoiceToTextApp:
                     # Cleanup
                     try:
                         os.remove(audio_file)
-                    except:
-                        pass
+                    except OSError as e:
+                        # Log the specific error but don't crash the application
+                        self.logger.warning(f"Failed to remove audio file {audio_file}: {e}")
+                    except Exception as e:
+                        self.logger.error(f"Unexpected error removing audio file {audio_file}: {e}")
             except queue.Empty:
                 continue
+            except Exception as e:
+                self.logger.error(f"Error in audio processor: {e}")
 
     def transcription_worker(self):
         """Worker thread for injecting transcriptions"""
-        while self.running:
+        while self.running and not self.should_quit:
             try:
                 transcript = self.transcription_queue.get(timeout=1)
                 if transcript and self.active_window:
@@ -180,13 +195,25 @@ class VoiceToTextApp:
                         self.text_injector.inject_text(transcript)
             except queue.Empty:
                 continue
+            except Exception as e:
+                self.logger.error(f"Error in transcription worker: {e}")
 
     def quit(self):
         """Shutdown the application"""
+        if self.should_quit:  # Prevent multiple shutdowns
+            return
+
         self.logger.info("Shutting down...")
+        self.should_quit = True
         self.running = False
+
+        # Stop all components
         self.keyboard_handler.stop()
         self.tray_icon.stop()
         self.stop_recording()
         self.stop_listening_mode()
-        sys.exit(0)
+
+        # Give threads time to finish
+        time.sleep(0.5)
+
+        self.logger.info("Application shutdown complete")

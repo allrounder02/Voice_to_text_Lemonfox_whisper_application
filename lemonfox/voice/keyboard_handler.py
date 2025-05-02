@@ -1,6 +1,7 @@
 from pynput import keyboard
 import threading
 import logging
+import atexit
 
 
 class KeyboardHandler:
@@ -10,10 +11,14 @@ class KeyboardHandler:
         self.listener = None
         self.current_keys = set()
         self.running = False
+        self.logger = logging.getLogger(__name__)
 
         # Default shortcuts
         self.toggle_recording_hotkey = {keyboard.Key.ctrl_l, keyboard.Key.alt_l, keyboard.KeyCode.from_char('v')}
         self.listening_mode_hotkey = {keyboard.Key.ctrl_l, keyboard.Key.alt_l, keyboard.KeyCode.from_char('l')}
+
+        # Register cleanup on exit
+        atexit.register(self.stop)
 
     def start(self):
         """Start keyboard listener in background thread"""
@@ -21,36 +26,52 @@ class KeyboardHandler:
             self.running = True
             self.listener = keyboard.Listener(
                 on_press=self._on_press,
-                on_release=self._on_release
+                on_release=self._on_release,
+                suppress=False  # Don't suppress keys so console can still receive them
             )
             self.listener.start()
-            logging.info("Keyboard handler started")
+            self.logger.info("Keyboard handler started (non-suppressing mode)")
 
     def stop(self):
         """Stop keyboard listener"""
         if self.running:
             self.running = False
             if self.listener:
-                self.listener.stop()
+                try:
+                    self.listener.stop()
+                except:
+                    pass
                 self.listener = None
-            logging.info("Keyboard handler stopped")
+            self.logger.info("Keyboard handler stopped")
 
     def _on_press(self, key):
         """Handle key press events"""
         try:
+            # Don't intercept Ctrl+C - let it pass through to the system
+            if key == keyboard.Key.ctrl_l:
+                self.current_keys.add(key)
+            elif hasattr(key, 'char') and key.char == 'c':
+                # Check if this is Ctrl+C
+                if keyboard.Key.ctrl_l in self.current_keys:
+                    # Let the system handle Ctrl+C
+                    self.logger.debug("Ctrl+C detected - passing through to system")
+                    return  # Don't handle this key press
+
+            # For all other keys, add to current keys
             self.current_keys.add(key)
 
-            # Check for hotkey combinations
-            if self._is_hotkey_active(self.toggle_recording_hotkey):
-                if self.on_toggle_recording:
-                    threading.Thread(target=self.on_toggle_recording, daemon=True).start()
+            # Check for hotkey combinations (excluding Ctrl+C)
+            if not (key == keyboard.KeyCode.from_char('c') and keyboard.Key.ctrl_l in self.current_keys):
+                if self._is_hotkey_active(self.toggle_recording_hotkey):
+                    if self.on_toggle_recording:
+                        threading.Thread(target=self.on_toggle_recording, daemon=True).start()
 
-            elif self._is_hotkey_active(self.listening_mode_hotkey):
-                if self.on_start_listening:
-                    threading.Thread(target=self.on_start_listening, daemon=True).start()
+                elif self._is_hotkey_active(self.listening_mode_hotkey):
+                    if self.on_start_listening:
+                        threading.Thread(target=self.on_start_listening, daemon=True).start()
 
-        except AttributeError:
-            pass
+        except Exception as e:
+            self.logger.debug(f"Error in key press handler: {e}")
 
     def _on_release(self, key):
         """Handle key release events"""
@@ -61,7 +82,7 @@ class KeyboardHandler:
 
     def _is_hotkey_active(self, hotkey):
         """Check if all keys in hotkey are currently pressed"""
-        return self.current_keys.issuperset(hotkey)
+        return hotkey.issubset(self.current_keys)
 
     def update_hotkeys(self, toggle_shortcut=None, listening_shortcut=None):
         """Update hotkey combinations"""
@@ -89,6 +110,6 @@ class KeyboardHandler:
                 try:
                     keys.add(getattr(keyboard.Key, part))
                 except AttributeError:
-                    logging.warning(f"Unknown key: {part}")
+                    self.logger.warning(f"Unknown key: {part}")
 
         return keys

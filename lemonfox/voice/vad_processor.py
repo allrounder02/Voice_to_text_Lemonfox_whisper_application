@@ -1,10 +1,12 @@
-import webrtcvad  # numpy import removed as it's unused
+import webrtcvad
 import collections
 import wave
 import tempfile
 from datetime import datetime
 import os
 import logging
+import numpy as np
+import queue
 
 
 class VADProcessor:
@@ -18,52 +20,115 @@ class VADProcessor:
         self.silence_threshold = silence_threshold
         self.frame_duration_ms = frame_duration_ms
         self.sample_rate = 16000  # WebRTC VAD requires 8000, 16000, 32000, or 48000 Hz
-        self.frame_size = int(self.sample_rate * frame_duration_ms / 1000)
+        self.frame_size = int(self.sample_rate * frame_duration_ms / 1000) * 2  # 2 bytes per sample for 16-bit audio
         self.temp_dir = os.path.join(tempfile.gettempdir(), 'lemonfox_vad')
         os.makedirs(self.temp_dir, exist_ok=True)
+        self.logger = logging.getLogger(__name__)
 
-    def process_stream(self, audio_stream, callback):
-        """Process continuous audio stream with VAD"""
+    def process_stream(self, audio_queue, callback):
+        """Process audio from a queue with VAD"""
         frame_buffer = collections.deque(maxlen=int(self.silence_threshold * 1000 / self.frame_duration_ms))
         is_speech = False
         speech_frames = []
-
-        # Create a consistent silence counter for the method
         silence_frames = 0
 
-        for frame in self._frame_generator(audio_stream):
-            is_speech_frame = self.vad.is_speech(frame, self.sample_rate)
-            frame_buffer.append((frame, is_speech_frame))
+        try:
+            while True:
+                try:
+                    # Get audio data from queue with timeout
+                    audio_chunk = audio_queue.get(timeout=1)
 
-            if is_speech_frame:
-                if not is_speech:
-                    # Speech started
-                    is_speech = True
-                    silence_frames = 0
-                    speech_frames = []
+                    if audio_chunk is None:  # End signal
+                        break
 
-                speech_frames.append(frame)
-                silence_frames = 0
-            else:
-                if is_speech:
-                    silence_frames += 1
-                    speech_frames.append(frame)
+                    # Convert to bytes if necessary
+                    if isinstance(audio_chunk, np.ndarray):
+                        # Ensure it's 16-bit PCM
+                        if audio_chunk.dtype != np.int16:
+                            audio_chunk = (audio_chunk * 32767).astype(np.int16)
+                        audio_bytes = audio_chunk.tobytes()
+                    else:
+                        audio_bytes = audio_chunk
 
-                    if silence_frames * self.frame_duration_ms >= self.silence_threshold * 1000:
-                        # Speech ended after silence threshold
-                        is_speech = False
-                        if speech_frames:
-                            audio_file = self._save_speech(speech_frames)
-                            callback(audio_file)
-                        silence_frames = 0
-                        speech_frames = []
+                    # Process frames from the audio chunk
+                    for frame in self._frame_generator(audio_bytes):
+                        try:
+                            # Validate frame size
+                            if len(frame) != self.frame_size:
+                                # Pad frame to correct size if needed
+                                if len(frame) < self.frame_size:
+                                    frame = frame + b'\x00' * (self.frame_size - len(frame))
+                                else:
+                                    # Truncate frame if too long
+                                    frame = frame[:self.frame_size]
+
+                            # Additional check: ensure frame has proper sample count
+                            expected_samples = self.frame_size // 2  # 2 bytes per sample
+                            actual_samples = len(frame) // 2
+
+                            if actual_samples != expected_samples:
+                                self.logger.warning(
+                                    f"Frame sample count mismatch: expected {expected_samples}, got {actual_samples}")
+                                continue
+
+                            is_speech_frame = self.vad.is_speech(frame, self.sample_rate)
+                            frame_buffer.append((frame, is_speech_frame))
+
+                            if is_speech_frame:
+                                if not is_speech:
+                                    # Speech started
+                                    is_speech = True
+                                    silence_frames = 0
+                                    speech_frames = []
+
+                                speech_frames.append(frame)
+                                silence_frames = 0
+                            else:
+                                if is_speech:
+                                    silence_frames += 1
+                                    speech_frames.append(frame)
+
+                                    if silence_frames * self.frame_duration_ms >= self.silence_threshold * 1000:
+                                        # Speech ended after silence threshold
+                                        is_speech = False
+                                        if speech_frames:
+                                            audio_file = self._save_speech(speech_frames)
+                                            callback(audio_file)
+                                        silence_frames = 0
+                                        speech_frames = []
+                        except Exception as e:
+                            self.logger.error(f"Error processing frame: {e}")
+                            # Log frame details for debugging
+                            self.logger.debug(f"Frame details: length={len(frame)}, expected={self.frame_size}")
+                            continue
+
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    self.logger.error(f"Error processing audio chunk: {e}")
+                    continue
+
+        except Exception as e:
+            self.logger.error(f"Error in VAD processing: {e}")
+        finally:
+            # Process any remaining speech frames
+            if speech_frames:
+                audio_file = self._save_speech(speech_frames)
+                callback(audio_file)
 
     def _frame_generator(self, audio_data):
         """Generate frames from audio data"""
         offset = 0
-        while offset + self.frame_size <= len(audio_data):
-            yield audio_data[offset:offset + self.frame_size]
-            offset += self.frame_size
+        frame_length = self.frame_size
+
+        while offset + frame_length <= len(audio_data):
+            frame = audio_data[offset:offset + frame_length]
+
+            # Ensure frame is exactly the right size
+            if len(frame) == frame_length:
+                yield frame
+
+            offset += frame_length
 
     def _save_speech(self, frames):
         """Save detected speech to WAV file"""
@@ -92,10 +157,10 @@ class VADProcessor:
                 if file_age.total_seconds() / 60 > age_minutes:
                     try:
                         os.remove(file_path)
-                        logging.debug(f"Removed old VAD temp file: {file_path}")
+                        self.logger.debug(f"Removed old VAD temp file: {file_path}")
                     except PermissionError:
-                        logging.warning(f"Permission denied when deleting: {file_path}")
+                        self.logger.warning(f"Permission denied when deleting: {file_path}")
                     except OSError as e:
-                        logging.warning(f"Error deleting file {file_path}: {e}")
-                    except Exception as e:  # Last resort for unexpected errors
-                        logging.error(f"Unexpected error deleting file {file_path}: {e}")
+                        self.logger.warning(f"Error deleting file {file_path}: {e}")
+                    except Exception as e:
+                        self.logger.error(f"Unexpected error deleting file {file_path}: {e}")

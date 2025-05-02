@@ -113,22 +113,48 @@ class TextInjector:
         except:
             pass
 
+    # Modified version of TextInjector.focus_window method
     def focus_window(self, window_info):
-        """Focus a specific window (platform-specific implementation)"""
+        """Focus a specific window with improved error handling"""
         if not self.platform_available:
             logging.warning("Platform functionality not available")
             return False
 
+        # Safety check for empty window info
+        if not window_info:
+            logging.warning("Empty window info provided")
+            return False
+
         try:
             if self.platform == 'windows':
-                if 'handle' in window_info:
-                    self.win32gui.SetForegroundWindow(window_info['handle'])
+                if 'handle' in window_info and window_info['handle']:
+                    # Try focusing with multiple methods
+                    try:
+                        # Try SetForegroundWindow first
+                        self.win32gui.SetForegroundWindow(window_info['handle'])
+                    except Exception as e:
+                        logging.warning(f"SetForegroundWindow failed: {e}")
+                        # Try alternate method - simulate Alt+Tab
+                        pyautogui.keyDown('alt')
+                        pyautogui.press('tab')
+                        pyautogui.keyUp('alt')
+                        time.sleep(0.2)
+                else:
+                    # No handle, try focusing by title
+                    if 'title' in window_info and window_info['title']:
+                        # Focus by title using Alt+Tab sequence
+                        pyautogui.keyDown('alt')
+                        pyautogui.press('tab')
+                        pyautogui.keyUp('alt')
+                        time.sleep(0.2)
             elif self.platform == 'darwin':
+                # macOS implementation remains unchanged
                 import subprocess
                 if 'bundle' in window_info:
                     subprocess.run(['osascript', '-e',
                                     f'tell application "{window_info["bundle"]}" to activate'])
             else:  # Linux
+                # Linux implementation remains unchanged
                 import subprocess
                 if 'title' in window_info:
                     subprocess.run(['xdotool', 'search', '--name', window_info['title'],
@@ -136,4 +162,5 @@ class TextInjector:
             return True
         except Exception as e:
             logging.error(f"Failed to focus window: {e}")
+            # Don't throw an exception, just return false
             return False

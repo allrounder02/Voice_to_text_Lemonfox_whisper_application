@@ -3,14 +3,33 @@
 Main entry point for the LemonFox Transcription Application.
 
 This script provides a menu-driven interface for accessing different
-transcription modes.
+transcription modes with system tray integration.
 """
 
 import os
 import sys
 import argparse
 import logging
-import time  # Added for voice activation fix
+import time
+import msvcrt  # For clearing input buffer on Windows
+import signal
+import platform
+import glob
+
+# Fix TCL/TK paths before importing tkinter
+if platform.system() == "Windows":
+    try:
+        python_dir = sys.prefix
+        tcl_paths = glob.glob(os.path.join(python_dir, 'tcl', 'tcl*'))
+        tk_paths = glob.glob(os.path.join(python_dir, 'tcl', 'tk*'))
+
+        if tcl_paths:
+            os.environ['TCL_LIBRARY'] = tcl_paths[0]
+        if tk_paths:
+            os.environ['TK_LIBRARY'] = tk_paths[0]
+            os.environ['TKPATH'] = tk_paths[0]
+    except Exception as e:
+        logging.warning(f"Could not configure TCL/TK paths: {e}")
 
 # Configure logging - kept from original
 logging.basicConfig(
@@ -32,7 +51,17 @@ from lemonfox import (
 
 # Import new voice module if available
 if VOICE_AVAILABLE:
-    from lemonfox.voice import VoiceToTextApp
+    from lemonfox.voice import VoiceToTextApp, TrayIcon
+
+# Global flag for handling interrupts
+interrupt_received = False
+
+
+def signal_handler(signum, frame):
+    """Global signal handler for SIGINT"""
+    global interrupt_received
+    interrupt_received = True
+    logger.info("Interrupt signal received")
 
 
 def display_menu():
@@ -49,12 +78,36 @@ def display_menu():
 
 
 def get_user_choice():
-    """Get and validate user choice."""
+    """Get and validate user choice with proper encoding handling."""
+    choice_bytes = None  # Initialize outside the try block
+
     while True:
-        choice = input("\nEnter your choice (1-6): ").strip()
-        if choice in ['1', '2', '3', '4', '5', '6']:
-            return choice
-        print("Invalid choice. Please enter a number between 1 and 6.")
+        try:
+            # Use sys.stdin.readline() instead of input()
+            sys.stdout.write("\nEnter your choice (1-6): ")
+            sys.stdout.flush()
+
+            # Read line and handle encoding
+            choice_bytes = sys.stdin.buffer.readline()
+            choice = choice_bytes.decode('utf-8', errors='ignore').strip()
+
+            if choice in ['1', '2', '3', '4', '5', '6']:
+                return choice
+
+            if choice:  # Only print error if something was actually entered
+                print("Invalid choice. Please enter a number between 1 and 6.")
+        except UnicodeDecodeError as e:
+            logger.error(f"Encoding error: {e}")
+            # Try again without decoding
+            try:
+                choice = choice_bytes.decode('latin-1').strip()
+                if choice in ['1', '2', '3', '4', '5', '6']:
+                    return choice
+            except:
+                continue
+        except Exception as e:
+            logger.error(f"Error reading input: {e}")
+            continue
 
 
 def transcribe_url():
@@ -108,41 +161,83 @@ def transcribe_file():
 
 
 def start_voice_activation():
-    """Start voice-activated transcription mode."""
+    """Start voice-activated transcription mode with tray icon."""
+    global interrupt_received
+    interrupt_received = False
+
     print("Starting voice-activated transcription...")
-    print("The system will now listen for voice input. Press Ctrl+C to return to menu.")
+    print("The system will now listen for voice input. Check the system tray for status.")
+    print("Press Ctrl+C to return to menu.")
 
     try:
-        transcriber = VoiceActivationTranscriber()  # Fixed: removed config parameter
+        transcriber = VoiceActivationTranscriber()
         transcriber.start_voice_activation()
         transcriber.start_continuous_listening()
 
+        # Create a simple tray icon for this mode
+        tray_icon = TrayIcon(
+            app_name="LemonFox Voice (Continuous)",
+            on_toggle_recording=lambda: None,  # Not used in this mode
+            on_toggle_listening=lambda: None,  # Not used in this mode
+            on_quit=lambda: None
+        )
+        tray_icon.start()
+        tray_icon.update_status(recording=False, listening=True)
+
         # Keep the program running until interrupted
         try:
-            while True:
+            while not interrupt_received:
                 time.sleep(1)
         except KeyboardInterrupt:
+            print("\nCtrl+C detected. Stopping voice activation...")
+        finally:
             transcriber.stop_continuous_listening()
             transcriber.stop_voice_activation()
-            print("\nReturning to main menu...")
+            tray_icon.stop()
+            print("Returning to main menu...")
+            # Clear any remaining input buffer (Windows-specific)
+            try:
+                while msvcrt.kbhit():
+                    msvcrt.getch()
+            except:
+                pass
+
     except Exception as e:
         logger.error(f"Error in voice activation: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
 
 
 def start_voice_recording():
-    """Start voice recording mode."""
+    """Start voice recording mode with tray icon."""
+    global interrupt_received
+    interrupt_received = False
+
     if not VOICE_AVAILABLE:
         print("Voice recording module not available. Please install voice dependencies.")
         return
 
     print("\n=== Voice Recording Mode ===")
+    print("System tray icon is now active. Right-click for options.")
     print("Press Ctrl+Alt+V to start/stop recording")
     print("Press Enter to return to main menu")
+
+    voice_app = None  # Initialize outside the try block
 
     try:
         voice_app = VoiceToTextApp()
         voice_app.start()
-        input()  # Wait for user to press Enter
+
+        # Use a proper input function that waits for Enter
+        try:
+            while not interrupt_received:
+                if msvcrt.kbhit():
+                    key = msvcrt.getch()
+                    if key == b'\r':  # Enter key
+                        break
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            print("\nCtrl+C detected. Returning to menu...")
     except Exception as e:
         logger.error(f"Error in voice recording: {e}")
         print(f"Error: {e}")
@@ -152,31 +247,56 @@ def start_voice_recording():
 
 
 def start_voice_listening():
-    """Start voice listening mode with VAD."""
+    """Start voice listening mode with VAD, tray icon, and status window."""
+    global interrupt_received
+    interrupt_received = False
+
     if not VOICE_AVAILABLE:
         print("Voice listening module not available. Please install voice dependencies.")
         return
 
     print("\n=== Voice Listening Mode ===")
+    print("System tray icon is now active with status window available.")
     print("Press Ctrl+Alt+L to start/stop listening")
     print("System will transcribe speech after pauses")
     print("Press Enter to return to main menu")
+
+    voice_app = None  # Initialize outside the try block
 
     try:
         voice_app = VoiceToTextApp()
         voice_app.start()
         voice_app.start_listening_mode()
-        input()  # Wait for user to press Enter
+
+        # Show status window immediately when starting listening mode
+        if hasattr(voice_app, 'tray_icon') and voice_app.tray_icon:
+            voice_app.tray_icon.show_status_window(None, None)
+
+        # Use a proper input function that waits for Enter
+        try:
+            while not interrupt_received:
+                if msvcrt.kbhit():
+                    key = msvcrt.getch()
+                    if key == b'\r':  # Enter key
+                        break
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            print("\nCtrl+C detected. Returning to menu...")
     except Exception as e:
         logger.error(f"Error in voice listening: {e}")
         print(f"Error: {e}")
     finally:
-        if 'voice_app' in locals():
+        if voice_app is not None:  # Check if voice_app was initialized
             voice_app.quit()
 
 
 def main():
     """Main application entry point."""
+    global interrupt_received
+
+    # Set up global signal handler
+    signal.signal(signal.SIGINT, signal_handler)
+
     parser = argparse.ArgumentParser(description="LemonFox Transcription Application")
     parser.add_argument('--direct', choices=['url', 'file', 'voice', 'voice-recording', 'voice-listening'],
                         help="Directly launch a specific mode without menu")
@@ -213,23 +333,30 @@ def main():
         return
 
     # Main menu loop
-    while True:
-        display_menu()
-        choice = get_user_choice()
+    while not interrupt_received:
+        try:
+            display_menu()
+            choice = get_user_choice()
 
-        if choice == '1':
-            transcribe_url()
-        elif choice == '2':
-            transcribe_file()
-        elif choice == '3':
-            start_voice_activation()
-        elif choice == '4' and VOICE_AVAILABLE:
-            start_voice_recording()
-        elif choice == '5' and VOICE_AVAILABLE:
-            start_voice_listening()
-        elif choice == '6':
-            print("Goodbye!")
+            if choice == '1':
+                transcribe_url()
+            elif choice == '2':
+                transcribe_file()
+            elif choice == '3':
+                start_voice_activation()
+            elif choice == '4' and VOICE_AVAILABLE:
+                start_voice_recording()
+            elif choice == '5' and VOICE_AVAILABLE:
+                start_voice_listening()
+            elif choice == '6':
+                print("Goodbye!")
+                break
+        except KeyboardInterrupt:
+            print("\nCtrl+C detected. Exiting...")
             break
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            print("An error occurred. Please try again.")
 
 
 if __name__ == "__main__":

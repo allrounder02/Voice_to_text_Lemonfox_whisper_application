@@ -7,6 +7,8 @@ except ImportError:
     exit(1)
 
 import sys
+import os
+import glob
 
 # Define platform-specific dependencies
 platform_deps = []
@@ -16,6 +18,24 @@ elif sys.platform == 'darwin':
     platform_deps = ['pyobjc-framework-Cocoa']
 elif sys.platform.startswith('linux'):
     platform_deps = []  # System packages required: python3-xlib, xdotool
+
+# Add TCL/TK environment setup for Windows
+if sys.platform == 'win32':
+    # Try to find TCL/TK libraries and set environment variables
+    try:
+        # Common Python installation paths
+        python_dir = sys.prefix
+        tcl_paths = glob.glob(os.path.join(python_dir, 'tcl', 'tcl*'))
+        tk_paths = glob.glob(os.path.join(python_dir, 'tcl', 'tk*'))
+
+        if tcl_paths:
+            os.environ['TCL_LIBRARY'] = tcl_paths[0]
+        if tk_paths:
+            os.environ['TK_LIBRARY'] = tk_paths[0]
+
+        print("TCL/TK paths configured successfully")
+    except Exception as e:
+        print(f"Warning: Could not configure TCL/TK paths: {e}")
 
 setup(
     name="lemonfox",
@@ -34,6 +54,7 @@ setup(
         # Voice module dependencies (optional)
         'sounddevice>=0.4.5',
         'webrtcvad>=2.0.10',
+        'tk>=0.1.0',  # Ensure Tkinter support
     ],
     extras_require={
         'voice': [
